@@ -1,0 +1,36 @@
+<div id="statusNoteFloating" class="drawer-content flexGap5">
+    <div class="panelControlBar flex-container alignItemsBaseline">
+        <div class="fa-fw fa-solid fa-grip drag-grabber"></div>
+        <div class="statusNoteTitle"><b>Status Note</b></div>
+        <div id="statusNoteClose" class="fa-fw fa-solid fa-circle-xmark floating_panel_close" title="Close"></div>
+    </div>
+
+    <div class="scrollY statusNoteBody">
+        <textarea id="statusNoteText" class="text_pole textarea_compact" rows="8"></textarea>
+
+        <div class="extension_token_counter">
+            <span>Tokens:</span> <span id="statusNoteTokenCounter">0</span>
+        </div>
+
+        <label class="checkbox_label" for="statusNoteAllowWIScan">
+            <input id="statusNoteAllowWIScan" type="checkbox" />
+            <span>Include in World Info Scanning</span>
+        </label>
+
+        <label class="checkbox_label alignItemsCenter statusNoteDepthRow" for="statusNoteDepth">
+            <span>In-chat @ Depth:</span>
+            <input id="statusNoteDepth" class="text_pole textarea_compact widthNatural" type="number" min="0" max="9999" />
+            <span>as</span>
+            <select id="statusNoteRole" class="text_pole widthNatural">
+                <option value="0">System</option>
+                <option value="1">User</option>
+                <option value="2">Assistant</option>
+            </select>
+        </label>
+
+        <label class="checkbox_label" for="statusNoteEnabled">
+            <input id="statusNoteEnabled" type="checkbox" />
+            <span>Enabled</span>
+        </label>
+    </div>
+</div>

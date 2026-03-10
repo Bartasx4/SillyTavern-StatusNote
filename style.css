@@ -1,0 +1,45 @@
+#statusNoteFloating {
+    overflow-y: auto;
+    max-width: 90dvw;
+    max-height: 90dvh;
+    min-width: 100px;
+    min-height: 100px;
+    border-radius: 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    position: fixed;
+    padding: 10px;
+    padding-top: 25px;
+    display: none;
+    flex-direction: column;
+    box-shadow: 0 0 10px var(--black70a);
+    z-index: 4000;
+    left: 0;
+    top: 0;
+    margin: 0;
+    right: unset;
+    width: calc(((100dvw - var(--sheldWidth)) / 2) - 1px);
+    height: unset;
+}
+
+#statusNoteFloating .drag-grabber {
+    position: unset;
+}
+
+.statusNoteTitle {
+    flex: 1;
+    padding-left: 6px;
+    user-select: none;
+}
+
+.statusNoteDepthRow {
+    gap: 8px;
+}
+
+.statusNoteBody {
+    width: 100%;
+}
+
+.statusNoteBody textarea {
+    font-size: calc(var(--mainFontSize) * 0.9);
+    line-height: 1.2;
+}
