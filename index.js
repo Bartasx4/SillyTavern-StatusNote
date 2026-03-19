@@ -1,3 +1,19 @@
+/**
+ * Status Note - SillyTavern extension
+ *
+ * Stores prompt + settings in chat metadata (chat file), under:
+ *   chat_metadata.status_note = {
+ *     prompt, include_worldInfo, depth, role, enabled
+ *   }
+ *
+ * This makes the settings branch-aware (each branch is a separate chat file)
+ * and allows exporting/importing chats together with Status Note configuration.
+ *
+ * IMPORTANT:
+ * - Do not keep a long-lived reference to `chatMetadata` (it changes on chat switch).
+ * - Always use `SillyTavern.getContext().chatMetadata`.
+ */
+
 import {
     MAX_INJECTION_DEPTH,
     animation_duration,
@@ -8,233 +24,202 @@ import {
     saveSettingsDebounced,
 } from '../../../../script.js';
 
-import { renderExtensionTemplateAsync, getContext } from '../../../extensions.js';
+import { renderExtensionTemplateAsync } from '../../../extensions.js';
 import { debounce, delay, getCharaFilename } from '../../../utils.js';
 import { getTokenCountAsync } from '../../../tokenizers.js';
-import { debounce_timeout } from '../../../constants.js';
 
 export const MODULE_NAME = 'status_note';
 const TEMPLATE_PATH = 'third-party/SillyTavern-StatusNote';
 
-const defaultProfile = Object.freeze({
-    enabled: false,
-    allowWIScan: false,
-    depth: 4,
-    role: extension_prompt_roles.SYSTEM,
+const CHAT_METADATA_KEY = 'status_note';
+const UI_SETTINGS_KEY = 'status_note_ui';
+
+const DEFAULT_NOTE = Object.freeze({
     prompt: '',
-});
-
-const defaultSettings = Object.freeze({
-    windowOpen: false,
-    profiles: {},
-    lastProfileByBase: {},
-
-    // legacy fields from previous version (kept for migration)
-    enabled: false,
-    allowWIScan: false,
+    include_worldInfo: false,
     depth: 4,
     role: extension_prompt_roles.SYSTEM,
-    prompts: {},
+    enabled: false,
 });
 
-// ------------------------------
-// Settings helpers
-// ------------------------------
+const DEFAULT_UI = Object.freeze({
+    windowOpen: false,
+});
 
-function getSettings() {
+const saveMetadataDebounced = debounce(async () => {
     const ctx = SillyTavern.getContext();
-    const { extensionSettings } = ctx;
+    if (typeof ctx.saveMetadata !== 'function') return;
 
-    if (!extensionSettings[MODULE_NAME]) {
-        extensionSettings[MODULE_NAME] = structuredClone(defaultSettings);
+    try {
+        await ctx.saveMetadata();
+    } catch (err) {
+        console.warn('[Status Note] Failed to save chat metadata:', err);
     }
+}, 400);
 
-    for (const k of Object.keys(defaultSettings)) {
-        if (!Object.hasOwn(extensionSettings[MODULE_NAME], k)) {
-            extensionSettings[MODULE_NAME][k] = structuredClone(defaultSettings[k]);
-        }
-    }
-
-    if (typeof extensionSettings[MODULE_NAME].profiles !== 'object' || extensionSettings[MODULE_NAME].profiles === null) {
-        extensionSettings[MODULE_NAME].profiles = {};
-    }
-
-    if (typeof extensionSettings[MODULE_NAME].lastProfileByBase !== 'object' || extensionSettings[MODULE_NAME].lastProfileByBase === null) {
-        extensionSettings[MODULE_NAME].lastProfileByBase = {};
-    }
-
-    if (typeof extensionSettings[MODULE_NAME].prompts !== 'object' || extensionSettings[MODULE_NAME].prompts === null) {
-        extensionSettings[MODULE_NAME].prompts = {};
-    }
-
-    return extensionSettings[MODULE_NAME];
-}
-
-function cloneProfile(profile = {}) {
-    return {
-        enabled: !!profile.enabled,
-        allowWIScan: !!profile.allowWIScan,
-        depth: Number.isFinite(Number(profile.depth)) ? Number(profile.depth) : 4,
-        role: Number.isFinite(Number(profile.role)) ? Number(profile.role) : extension_prompt_roles.SYSTEM,
-        prompt: String(profile.prompt ?? ''),
-    };
-}
-
-function getBaseKey() {
-    const context = getContext();
-
-    if (context.groupId) {
-        return `group:${context.groupId}`;
-    }
-
-    if (context.characterId === undefined || context.characterId === null) {
-        return null;
-    }
-
-    const fn = getCharaFilename?.();
-    if (!fn) return null;
-
-    return `char:${fn}`;
-}
-
-function getScopeKey() {
-    const context = getContext();
-    const baseKey = getBaseKey();
-    if (!baseKey) return null;
-
-    // chatId acts as branch identifier (different branches = different chat files/IDs)
-    const chatId = context.chatId || 'nochat';
-    return `${baseKey}::chat:${chatId}`;
+/**
+ * @returns {boolean} True if a character or group chat is currently active.
+ */
+function isChatActive() {
+    const ctx = SillyTavern.getContext();
+    return !!(ctx.groupId || ctx.characterId !== undefined);
 }
 
 /**
- * Creates the current branch profile if missing.
- * Priority:
- * 1) exact profile exists -> use it
- * 2) clone last used profile for same base (branch inheritance)
- * 3) migrate from legacy settings (old version)
- * 4) default profile
+ * Returns the extension's UI settings (global, not chat-specific).
  */
-function ensureCurrentProfile() {
-    const settings = getSettings();
-    const baseKey = getBaseKey();
-    const scopeKey = getScopeKey();
+function getUiSettings() {
+    const ctx = SillyTavern.getContext();
+    const { extensionSettings } = ctx;
 
-    if (!baseKey || !scopeKey) return null;
-
-    if (settings.profiles[scopeKey]) {
-        settings.lastProfileByBase[baseKey] = scopeKey;
-        return settings.profiles[scopeKey];
+    if (!extensionSettings[UI_SETTINGS_KEY]) {
+        extensionSettings[UI_SETTINGS_KEY] = structuredClone(DEFAULT_UI);
+    }
+    for (const key of Object.keys(DEFAULT_UI)) {
+        if (!Object.hasOwn(extensionSettings[UI_SETTINGS_KEY], key)) {
+            extensionSettings[UI_SETTINGS_KEY][key] = structuredClone(DEFAULT_UI[key]);
+        }
     }
 
-    let seeded = null;
+    return extensionSettings[UI_SETTINGS_KEY];
+}
 
-    // 1) Inherit from last used branch of same character/group (preferred)
-    const previousScopeKey = settings.lastProfileByBase[baseKey];
-    if (previousScopeKey && settings.profiles[previousScopeKey]) {
-        seeded = cloneProfile(settings.profiles[previousScopeKey]);
+/**
+ * Gets the current chat's Status Note object (merged with defaults).
+ * Does not persist changes automatically.
+ */
+function getChatNote() {
+    const ctx = SillyTavern.getContext();
+    const raw = ctx.chatMetadata?.[CHAT_METADATA_KEY];
+    const base = structuredClone(DEFAULT_NOTE);
+
+    if (raw && typeof raw === 'object') {
+        return Object.assign(base, raw);
     }
 
-    // 2) Legacy migration (older version stored global options + per-char prompt)
-    if (!seeded) {
-        const legacyPromptKey = baseKey.startsWith('group:')
-            ? baseKey.replace('group:', 'group:')
-            : baseKey.replace('char:', '');
+    return base;
+}
 
-        const legacyPrompt = baseKey.startsWith('char:')
-            ? String(settings.prompts?.[legacyPromptKey] ?? '')
-            : String(settings.prompts?.[legacyPromptKey] ?? '');
+/**
+ * Writes a fully merged note object into chat metadata and schedules persistence.
+ */
+function setChatNote(note) {
+    const ctx = SillyTavern.getContext();
+    if (!ctx.chatMetadata) return;
 
-        seeded = {
-            enabled: !!settings.enabled,
-            allowWIScan: !!settings.allowWIScan,
-            depth: Number(settings.depth ?? 4),
-            role: Number(settings.role ?? extension_prompt_roles.SYSTEM),
-            prompt: legacyPrompt,
+    ctx.chatMetadata[CHAT_METADATA_KEY] = Object.assign(structuredClone(DEFAULT_NOTE), note);
+    saveMetadataDebounced();
+}
+
+/**
+ * Applies a partial update to the chat note and schedules persistence.
+ */
+function patchChatNote(patch) {
+    setChatNote(Object.assign(getChatNote(), patch));
+}
+
+/**
+ * Best-effort migration from earlier versions that used extensionSettings.
+ * Runs only when chat metadata doesn't have `status_note` yet.
+ */
+function tryMigrateLegacySettings() {
+    const ctx = SillyTavern.getContext();
+    const legacy = ctx.extensionSettings?.[MODULE_NAME];
+    if (!legacy || typeof legacy !== 'object') return null;
+
+    // v1.0.x branch-aware profiles
+    const chatId = ctx.chatId || 'nochat';
+    const baseKey = ctx.groupId ? `group:${ctx.groupId}` : (getCharaFilename?.() ?? null);
+    if (baseKey && legacy.profiles && typeof legacy.profiles === 'object') {
+        const scopeKey = (ctx.groupId)
+            ? `group:${ctx.groupId}::chat:${chatId}`
+            : `char:${baseKey}::chat:${chatId}`;
+
+        const profile = legacy.profiles?.[scopeKey];
+        if (profile && typeof profile === 'object') {
+            return {
+                prompt: String(profile.prompt ?? ''),
+                include_worldInfo: !!profile.allowWIScan,
+                depth: Number(profile.depth ?? DEFAULT_NOTE.depth),
+                role: Number(profile.role ?? DEFAULT_NOTE.role),
+                enabled: !!profile.enabled,
+            };
+        }
+    }
+
+    // v1.0.x simple per-character prompt + global options
+    if (legacy.prompts && typeof legacy.prompts === 'object') {
+        const key = ctx.groupId ? `group:${ctx.groupId}` : (getCharaFilename?.() ?? null);
+        const prompt = key ? String(legacy.prompts[key] ?? '') : '';
+        return {
+            prompt,
+            include_worldInfo: !!legacy.allowWIScan,
+            depth: Number(legacy.depth ?? DEFAULT_NOTE.depth),
+            role: Number(legacy.role ?? DEFAULT_NOTE.role),
+            enabled: !!legacy.enabled,
         };
     }
 
-    settings.profiles[scopeKey] = cloneProfile(seeded || defaultProfile);
-    settings.lastProfileByBase[baseKey] = scopeKey;
-    saveSettingsDebounced();
-
-    return settings.profiles[scopeKey];
+    return null;
 }
 
-function getCurrentProfile() {
-    return ensureCurrentProfile();
-}
+/**
+ * Ensures chat metadata has a valid `status_note` object (with defaults applied).
+ */
+function ensureChatMetadataInitialized() {
+    const ctx = SillyTavern.getContext();
+    if (!ctx.chatMetadata) return;
 
-function updateCurrentProfile(mutator) {
-    const profile = ensureCurrentProfile();
-    if (!profile) return;
-
-    mutator(profile);
-
-    const baseKey = getBaseKey();
-    const scopeKey = getScopeKey();
-    const settings = getSettings();
-
-    if (baseKey && scopeKey) {
-        settings.lastProfileByBase[baseKey] = scopeKey;
+    if (!ctx.chatMetadata[CHAT_METADATA_KEY]) {
+        const migrated = tryMigrateLegacySettings();
+        setChatNote(migrated ?? DEFAULT_NOTE);
+        return;
     }
 
-    saveSettingsDebounced();
+    // Normalize missing keys after updates
+    setChatNote(getChatNote());
 }
 
-// ------------------------------
-// Injection
-// ------------------------------
-
+/**
+ * Clears injection completely.
+ */
 function clearInjection() {
-    const context = getContext();
-    context.setExtensionPrompt(MODULE_NAME, '', extension_prompt_types.NONE, MAX_INJECTION_DEPTH);
+    const ctx = SillyTavern.getContext();
+    ctx.setExtensionPrompt(MODULE_NAME, '', extension_prompt_types.NONE, MAX_INJECTION_DEPTH);
 }
 
+/**
+ * Applies Status Note injection based on current chat metadata.
+ */
 function applyInjection() {
-    const context = getContext();
-    const profile = getCurrentProfile();
+    const ctx = SillyTavern.getContext();
 
-    if (!profile) {
+    if (!isChatActive()) {
         clearInjection();
         return;
     }
 
-    if (!profile.enabled) {
+    const note = getChatNote();
+
+    if (!note.enabled || !String(note.prompt ?? '').trim()) {
         clearInjection();
         return;
     }
 
-    if (!context.groupId && (context.characterId === undefined || context.characterId === null)) {
-        clearInjection();
-        return;
-    }
-
-    const prompt = String(profile.prompt ?? '');
-    if (!prompt.trim()) {
-        clearInjection();
-        return;
-    }
-
-    // Always "In-chat"
     const positionInChat = 1;
 
-    context.setExtensionPrompt(
+    ctx.setExtensionPrompt(
         MODULE_NAME,
-        prompt,
+        String(note.prompt),
         positionInChat,
-        Number(profile.depth ?? 4),
-        !!profile.allowWIScan,
-        Number(profile.role ?? extension_prompt_roles.SYSTEM),
+        Number(note.depth ?? DEFAULT_NOTE.depth),
+        !!note.include_worldInfo,
+        Number(note.role ?? DEFAULT_NOTE.role),
     );
 }
 
-// ------------------------------
-// UI
-// ------------------------------
-
 function showWindow() {
-    const settings = getSettings();
+    const ui = getUiSettings();
     const $w = $('#statusNoteFloating');
     if ($w.length === 0) return;
 
@@ -242,80 +227,81 @@ function showWindow() {
         $w.addClass('resizing');
         $w.css('display', 'flex');
         $w.css('opacity', 0.0);
-        $w.transition(
-            { opacity: 1.0, duration: animation_duration },
-            async function () {
-                await delay(50);
-                $w.removeClass('resizing');
-            },
-        );
+
+        $w.transition({ opacity: 1.0, duration: animation_duration }, async function () {
+            await delay(50);
+            $w.removeClass('resizing');
+        });
     }
 
-    settings.windowOpen = true;
+    ui.windowOpen = true;
     saveSettingsDebounced();
 }
 
 function hideWindow() {
-    const settings = getSettings();
+    const ui = getUiSettings();
     const $w = $('#statusNoteFloating');
     if ($w.length === 0) return;
 
     if ($w.css('display') === 'flex') {
         $w.addClass('resizing');
-        $w.transition(
-            { opacity: 0.0, duration: animation_duration },
-            async function () {
-                await delay(50);
-                $w.css('display', 'none');
-                $w.removeClass('resizing');
-            },
-        );
+        $w.transition({ opacity: 0.0, duration: animation_duration }, async function () {
+            await delay(50);
+            $w.css('display', 'none');
+            $w.removeClass('resizing');
+        });
     }
 
-    settings.windowOpen = false;
+    ui.windowOpen = false;
     saveSettingsDebounced();
 }
 
-const setTokenCounterDebounced = debounce(
-    async (value) => {
-        const count = await getTokenCountAsync(String(value ?? ''));
-        $('#statusNoteTokenCounter').text(count);
-    },
-    debounce_timeout.relaxed,
-);
+const setTokenCounterDebounced = debounce(async (value) => {
+    const count = await getTokenCountAsync(String(value ?? ''));
+    $('#statusNoteTokenCounter').text(count);
+}, 250);
 
-function syncUIFromSettingsAndContext() {
-    const settings = getSettings();
-    const profile = getCurrentProfile();
+/**
+ * Syncs the UI from current chat metadata and reapplies prompt injection.
+ */
+function syncUiFromChat() {
+    const ui = getUiSettings();
 
-    if (!profile) {
+    if (!isChatActive()) {
         $('#statusNoteEnabled').prop('checked', false);
         $('#statusNoteAllowWIScan').prop('checked', false);
-        $('#statusNoteDepth').val(4);
-        $('#statusNoteRole').val(String(extension_prompt_roles.SYSTEM));
+        $('#statusNoteDepth').val(DEFAULT_NOTE.depth);
+        $('#statusNoteRole').val(String(DEFAULT_NOTE.role));
         $('#statusNoteText').val('');
         setTokenCounterDebounced('');
-        hideWindow();
         clearInjection();
+        hideWindow();
         return;
     }
 
-    $('#statusNoteEnabled').prop('checked', !!profile.enabled);
-    $('#statusNoteAllowWIScan').prop('checked', !!profile.allowWIScan);
-    $('#statusNoteDepth').val(Number(profile.depth ?? 4));
-    $('#statusNoteRole').val(String(Number(profile.role ?? extension_prompt_roles.SYSTEM)));
-    $('#statusNoteText').val(String(profile.prompt ?? ''));
+    ensureChatMetadataInitialized();
+    const note = getChatNote();
 
-    setTokenCounterDebounced(profile.prompt ?? '');
+    $('#statusNoteEnabled').prop('checked', !!note.enabled);
+    $('#statusNoteAllowWIScan').prop('checked', !!note.include_worldInfo);
+    $('#statusNoteDepth').val(Number(note.depth ?? DEFAULT_NOTE.depth));
+    $('#statusNoteRole').val(String(Number(note.role ?? DEFAULT_NOTE.role)));
+    $('#statusNoteText').val(String(note.prompt ?? ''));
+    setTokenCounterDebounced(note.prompt ?? '');
 
-    if (settings.windowOpen) showWindow();
+    if (ui.windowOpen) showWindow();
     else hideWindow();
 
     applyInjection();
 }
 
-function bindUI() {
+function bindUiHandlers() {
     $('#status_note_menu_item').on('click', () => {
+        if (!isChatActive()) {
+            if (window.toastr?.warning) toastr.warning('Select a character or a group chat first.');
+            return;
+        }
+
         const $w = $('#statusNoteFloating');
         if ($w.css('display') === 'flex') hideWindow();
         else showWindow();
@@ -325,70 +311,55 @@ function bindUI() {
 
     $('#statusNoteText').on('input', function () {
         const v = String($(this).val() ?? '');
-        updateCurrentProfile((p) => {
-            p.prompt = v;
-        });
+        patchChatNote({ prompt: v });
         setTokenCounterDebounced(v);
         applyInjection();
     });
 
     $('#statusNoteEnabled').on('input', function () {
-        const checked = !!$(this).prop('checked');
-        updateCurrentProfile((p) => {
-            p.enabled = checked;
-        });
+        patchChatNote({ enabled: !!$(this).prop('checked') });
         applyInjection();
     });
 
     $('#statusNoteAllowWIScan').on('input', function () {
-        const checked = !!$(this).prop('checked');
-        updateCurrentProfile((p) => {
-            p.allowWIScan = checked;
-        });
+        patchChatNote({ include_worldInfo: !!$(this).prop('checked') });
         applyInjection();
     });
 
     $('#statusNoteDepth').on('input', function () {
-        let value = Number($(this).val());
-        if (Number.isNaN(value)) value = 4;
-        if (value < 0) value = Math.abs(value);
-        $(this).val(value);
+        let depth = Number($(this).val());
+        if (!Number.isFinite(depth)) depth = DEFAULT_NOTE.depth;
+        if (depth < 0) depth = Math.abs(depth);
+        $(this).val(depth);
 
-        updateCurrentProfile((p) => {
-            p.depth = value;
-        });
-
+        patchChatNote({ depth });
         applyInjection();
     });
 
     $('#statusNoteRole').on('change input', function () {
-        const value = Number($(this).val());
-
-        updateCurrentProfile((p) => {
-            p.role = value;
-        });
-
+        const role = Number($(this).val());
+        patchChatNote({ role });
         applyInjection();
     });
 }
 
-async function renderUI() {
+async function renderUi() {
     const buttonHtml = await renderExtensionTemplateAsync(TEMPLATE_PATH, 'button');
     $('#extensionsMenu').append(buttonHtml);
 
     const windowHtml = await renderExtensionTemplateAsync(TEMPLATE_PATH, 'window');
     $('#movingDivs').append(windowHtml);
 
-    bindUI();
-    syncUIFromSettingsAndContext();
+    bindUiHandlers();
+    syncUiFromChat();
 }
 
 function bindEvents() {
-    // Triggered when switching character/chat/branch
     eventSource.on(event_types.CHAT_CHANGED, () => {
-        syncUIFromSettingsAndContext();
+        syncUiFromChat();
     });
 
+    // Keep injection fresh after prompt recombination (if event exists in the current ST build)
     if ('GENERATE_AFTER_COMBINE_PROMPTS' in event_types) {
         eventSource.on(event_types.GENERATE_AFTER_COMBINE_PROMPTS, () => {
             applyInjection();
@@ -397,8 +368,7 @@ function bindEvents() {
 }
 
 (async function init() {
-    getSettings();
-    await renderUI();
+    await renderUi();
     bindEvents();
     applyInjection();
 })();

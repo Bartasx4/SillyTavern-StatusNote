@@ -2,7 +2,7 @@
   "display_name": "Status Note",
   "loading_order": 25,
   "author": "Bartasx",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "js": "index.js",
   "css": "style.css",
   "homePage": "https://github.com/Bartasx4/SillyTavern-StatusNote",
